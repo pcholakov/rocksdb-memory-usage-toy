@@ -11,14 +11,17 @@ pub fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(path);
     std::fs::create_dir_all(path)?;
 
-    const COLUMN_FAMILY_COUNT: usize = 240;
-    const WRITE_BUFFER_MANAGER_CAPACITY_MIB: usize = 6000;
+    const TEST_DURATION_SECONDS: u64 = 60;
+    const COLUMN_FAMILY_COUNT: usize = 24;
+    const WRITE_BUFFER_MANAGER_CAPACITY_MIB: usize = 100;
 
+    let block_cache =
+        rocksdb::Cache::new_lru_cache(WRITE_BUFFER_MANAGER_CAPACITY_MIB * 2 * 1 << 20);
     let wbm = Arc::new(
         rocksdb::WriteBufferManager::new_write_buffer_manager_with_cache(
             WRITE_BUFFER_MANAGER_CAPACITY_MIB * 1 << 20,
             true,
-            rocksdb::Cache::new_lru_cache(0 * 1 << 20),
+            block_cache.clone(),
         ),
     );
 
@@ -27,9 +30,13 @@ pub fn main() -> anyhow::Result<()> {
     db_opts.create_missing_column_families(true);
     db_opts.set_write_buffer_manager(&*wbm);
 
+    let mut block_opts = rocksdb::BlockBasedOptions::default();
+    block_opts.set_block_cache(&block_cache);
+
     let mut cf_opts = rocksdb::Options::default();
     cf_opts.set_write_buffer_size(wbm.get_buffer_size() >> 2);
     cf_opts.set_max_write_buffer_number(2);
+    cf_opts.set_block_based_table_factory(&block_opts);
 
     let column_family_names: Vec<_> = (0..COLUMN_FAMILY_COUNT).map(|i| format!("cf{i}")).collect();
 
@@ -53,11 +60,10 @@ pub fn main() -> anyhow::Result<()> {
         "Writing to {} column families with 1KB values each",
         COLUMN_FAMILY_COUNT
     );
-    println!("Will run for 20 seconds...\n");
+    println!("Will run for {TEST_DURATION_SECONDS} seconds...\n");
 
     std::thread::scope(|s| -> anyhow::Result<()> {
         let monitor_handle = {
-            let wbm = Arc::clone(&wbm);
             let db = Arc::clone(&db);
             let running = Arc::clone(&running);
             let column_family_names = column_family_names.clone();
@@ -134,10 +140,11 @@ pub fn main() -> anyhow::Result<()> {
                             rss_max
                         );
 
-                        // let block_cache_usage = db.property_int_value_cf(
-                        //     db.cf_handle("default").unwrap(), "rocksdb.block-cache-usage").unwrap().unwrap();
-                        // println!("          block cache: {:6.2} MB", block_cache_usage as f64 / 1_048_576.0);
-
+                        let block_cache_usage = block_cache.get_usage();
+                        println!("          block cache usage: {:6.2} MB  ex WBM: {:6.2} MB",
+                            block_cache_usage as f64 / 1_048_576.0,
+                            block_cache_usage.saturating_sub(buffer_size) as f64 / 1_048_576.0,
+                        );
 
                         let mut cf_mins = Vec::new();
                         let mut cf_maxs = Vec::new();
@@ -195,7 +202,7 @@ pub fn main() -> anyhow::Result<()> {
             })
         };
 
-        let handles: Vec<_> = column_family_names
+        let write_handles: Vec<_> = column_family_names
             .iter()
             .enumerate()
             .map(|(idx, name)| {
@@ -208,7 +215,6 @@ pub fn main() -> anyhow::Result<()> {
 
                     let mut k = 0usize;
                     let mut ops_count = 0u64;
-                    // let thread_start = Instant::now();
 
                     while running.load(Ordering::Relaxed) {
                         db.put_cf(&cf, format!("thread{}_key{}", idx, k), &val)?;
@@ -220,24 +226,47 @@ pub fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // let thread_elapsed = thread_start.elapsed().as_secs_f64();
-                    // println!(
-                    //     "Thread {} completed: {} ops in {:.1}s ({:.0} ops/sec)",
-                    //     idx,
-                    //     ops_count,
-                    //     thread_elapsed,
-                    //     ops_count as f64 / thread_elapsed
-                    // );
+                    Ok(())
+                })
+            })
+            .collect();
+
+        let iter_handles: Vec<_> = column_family_names
+            .iter()
+            .map(|name| {
+                let db = Arc::clone(&db);
+                let running = Arc::clone(&running);
+
+                s.spawn(move || -> anyhow::Result<()> {
+                    let cf = db.cf_handle(&name).context("cf is created")?;
+
+                    while running.load(Ordering::Relaxed) {
+                        let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                        let mut count = 0;
+                        for item in iter {
+                            let (_key, _value) = item?;
+                            count += 1;
+                            if count % 10_000 == 0 {
+                                if !running.load(Ordering::Relaxed) {
+                                    break;
+                                };
+                            }
+                        }
+                    }
 
                     Ok(())
                 })
             })
             .collect();
 
-        std::thread::sleep(Duration::from_secs(20));
+        std::thread::sleep(Duration::from_secs(TEST_DURATION_SECONDS));
         running.store(false, Ordering::Relaxed);
 
-        for h in handles {
+        for h in write_handles {
+            h.join().unwrap()?;
+        }
+
+        for h in iter_handles {
             h.join().unwrap()?;
         }
 
