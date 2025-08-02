@@ -1,16 +1,18 @@
 use anyhow::Context;
+use statistical::{mean, median};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use sysinfo::{Pid, System};
 
 pub fn main() -> anyhow::Result<()> {
     let path = Path::new("target/db");
     let _ = std::fs::remove_dir_all(path);
     std::fs::create_dir_all(path)?;
 
-    const COLUMN_FAMILY_COUNT: usize = 24;
-    const WRITE_BUFFER_MANAGER_CAPACITY_MIB: usize = 1000;
+    const COLUMN_FAMILY_COUNT: usize = 240;
+    const WRITE_BUFFER_MANAGER_CAPACITY_MIB: usize = 6000;
 
     let wbm = Arc::new(
         rocksdb::WriteBufferManager::new_write_buffer_manager_with_cache(
@@ -61,23 +63,36 @@ pub fn main() -> anyhow::Result<()> {
             let column_family_names = column_family_names.clone();
 
             s.spawn(move || {
-                let mut overall_max_usage = 0usize;
-                let mut total_samples = 0u64;
-                let mut overall_total_usage = 0u64;
+                let mut overall_wbm_values = Vec::new();
+                let mut overall_rss_values = Vec::new();
+
+                let mut system = System::new_all();
+                let pid = Pid::from(std::process::id() as usize);
 
                 let mut last_report = Instant::now();
-                let mut sample_usages = Vec::new();
+                let mut sample_wbm_values = Vec::new();
+                let mut sample_rss_values = Vec::new();
                 let mut cf_samples: Vec<Vec<f64>> = vec![Vec::new(); column_family_names.len()];
 
                 while running.load(Ordering::Relaxed) {
                     let usage = wbm.get_usage();
                     let buffer_size = wbm.get_buffer_size();
 
-                    overall_max_usage = overall_max_usage.max(usage);
-                    total_samples += 1;
-                    overall_total_usage += usage as u64;
+                    system.refresh_process(pid);
+                    let rss = if let Some(process) = system.process(pid) {
+                        process.memory()
+                    } else {
+                        0
+                    };
 
-                    sample_usages.push(usage);
+                    let usage_mb = usage as f64 / 1_048_576.0;
+                    let rss_mb = rss as f64 / 1_024.0 / 1_024.0;
+
+                    overall_wbm_values.push(usage_mb);
+                    overall_rss_values.push(rss_mb);
+
+                    sample_wbm_values.push(usage_mb);
+                    sample_rss_values.push(rss_mb);
 
                     for (cf_idx, name) in column_family_names.iter().enumerate() {
                         let cf_handle = db.cf_handle(name).expect("cf exists");
@@ -92,20 +107,31 @@ pub fn main() -> anyhow::Result<()> {
                         let current_usage = usage;
                         let usage_percent = (current_usage as f64 / buffer_size as f64) * 100.0;
 
-                        let sample_min = sample_usages.iter().min().copied().unwrap_or(0);
-                        let sample_max = sample_usages.iter().max().copied().unwrap_or(0);
-                        let sample_avg = sample_usages.iter().sum::<usize>() as f64 / sample_usages.len() as f64;
+                        let wbm_p50 = median(&sample_wbm_values);
+                        let wbm_mean = mean(&sample_wbm_values);
+                        let wbm_max = sample_wbm_values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+
+                        let rss_p50 = median(&sample_rss_values);
+                        let rss_mean = mean(&sample_rss_values);
+                        let rss_max = sample_rss_values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
 
                         println!(
-                            "[{:6.1}s] WBM Current: {:8.2} MB / {:4.2} MB ({:5.1}%) | Sample Stats ({}): min={:.2}MB avg={:.2}MB max={:.2}MB",
-                            elapsed,
-                            current_usage as f64 / 1_048_576.0,
+                            "WBM Current: {:8.2} MB / {:4.2} MB ({:5.1}%) | Sample Stats ({}): p50={:.2}MB mean={:.2}MB max={:.2}MB",
+                            usage as f64 / 1_048_576.0,
                             buffer_size as f64 / 1_048_576.0,
                             usage_percent,
-                            sample_usages.len(),
-                            sample_min as f64 / 1_048_576.0,
-                            sample_avg / 1_048_576.0,
-                            sample_max as f64 / 1_048_576.0
+                            sample_wbm_values.len(),
+                            wbm_p50,
+                            wbm_mean,
+                            wbm_max
+                        );
+
+                        println!(
+                            "RSS: {:8.2} MB | Sample Stats: p50={:.2}MB mean={:.2}MB max={:.2}MB",
+                            rss_mb,
+                            rss_p50,
+                            rss_mean,
+                            rss_max
                         );
 
                         // let block_cache_usage = db.property_int_value_cf(
@@ -137,27 +163,35 @@ pub fn main() -> anyhow::Result<()> {
                             let max_of_maxs = cf_maxs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
                             let avg_of_avgs = cf_avgs.iter().sum::<f64>() / cf_avgs.len() as f64;
 
-                            println!("          CF stats:      min={:.2}MB avg={:.2}MB max={:.2}MB, total={:.2}MB (across {} CFs)\n",
+                            println!("CF stats:      min={:.2}MB avg={:.2}MB max={:.2}MB, total={:.2}MB (across {} CFs)\n",
                                     min_of_mins, avg_of_avgs, max_of_maxs, total_current, cf_mins.len());
                         }
 
-                        sample_usages.clear();
+                        sample_wbm_values.clear();
+                        sample_rss_values.clear();
                         for cf_data in &mut cf_samples {
                             cf_data.clear();
                         }
                         last_report = Instant::now();
                     }
 
-                    std::thread::sleep(Duration::from_millis(3));
+                    std::thread::sleep(Duration::from_millis(2));
                 }
 
-                println!("\nStatistics:");
-                println!("   Max usage: {:.2} MB ({:.1}%)",
-                    overall_max_usage as f64 / 1_048_576.0,
-                    (overall_max_usage as f64 / wbm.get_buffer_size() as f64) * 100.0
+                println!("\nFinal Statistics:");
+                let overall_wbm_max = overall_wbm_values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                println!("   WBM: p50={:.2}MB mean={:.2}MB max={:.2}MB ({:.1}%)",
+                    median(&overall_wbm_values),
+                    mean(&overall_wbm_values),
+                    overall_wbm_max,
+                    (overall_wbm_max / (wbm.get_buffer_size() as f64 / 1_048_576.0)) * 100.0
                 );
-                println!("   Avg usage: {:.2} MB", overall_total_usage as f64 / total_samples as f64 / 1_048_576.0);
-                println!("   Samples taken: {}", total_samples);
+                println!("   RSS: p50={:.2}MB mean={:.2}MB max={:.2}MB",
+                    median(&overall_rss_values),
+                    mean(&overall_rss_values),
+                    overall_rss_values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+                );
+                println!("   Samples taken: {}", overall_wbm_values.len());
             })
         };
 

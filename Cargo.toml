@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 rocksdb = { version = "0.42.1", package = "rust-rocksdb" }
+statistical = "1.0"
+sysinfo = "0.30"
 tempdir = "0.3.7"
