@@ -1,5 +1,6 @@
 use anyhow::Context;
 use bytesize::ByteSize;
+use clap::Parser;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -7,27 +8,54 @@ use std::time::{Duration, Instant};
 use sysinfo::Pid;
 use sysinfo::System;
 
-pub fn main() -> anyhow::Result<()> {
-    const TEST_DURATION_SECONDS: u64 = 20;
-    const COLUMN_FAMILY_COUNT: usize = 24; // every CF gets a writer
-    const COLUMN_FAMILY_READERS: usize = 24; // capped to CF count
-    const UNEVEN_WRITE_LOAD: bool = true;
-    const WRITE_BUFFER_SIZE_BYTES: usize = ByteSize::mib(3200).as_u64() as usize;
-    const BLOCK_CACHE_SIZE_BYTES: usize = ByteSize::mib(3200).as_u64() as usize; // excluding write buffers
-    const REPORT_INTERVAL_MILLIS: u64 = 1000;
-    const ALLOW_STALL: bool = true;
+#[derive(Parser)]
+#[command(name = "rocksdb-memory-usage")]
+struct Args {
+    #[arg(long, default_value = "target/db")]
+    db_path: String,
 
-    let path = Path::new("target/db");
+    #[arg(long, short = 'd', default_value_t = 20)]
+    test_duration_seconds: u64,
+
+    #[arg(long, short = 'c', default_value_t = 24)]
+    column_family_count: usize,
+
+    #[arg(long, short = 'r', default_value_t = 24)]
+    column_family_readers: usize,
+
+    #[arg(long, default_value_t = true)]
+    uneven_write_load: bool,
+
+    #[arg(long, default_value_t = 3200)]
+    write_buffer_size_mb: usize,
+
+    #[arg(long, default_value_t = 3200)]
+    block_cache_size_mb: usize,
+
+    #[arg(long, default_value_t = 1000)]
+    report_interval_millis: u64,
+
+    #[arg(long, short = 's', default_value_t = false)]
+    allow_stall: bool,
+}
+
+pub fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    let write_buffer_size_bytes = ByteSize::mib(args.write_buffer_size_mb as u64).as_u64() as usize;
+    let block_cache_size_bytes = ByteSize::mib(args.block_cache_size_mb as u64).as_u64() as usize;
+
+    let path = Path::new(&args.db_path);
     let _ = std::fs::remove_dir_all(path);
     std::fs::create_dir_all(path)?;
 
     let block_cache =
-        rocksdb::Cache::new_lru_cache(BLOCK_CACHE_SIZE_BYTES + WRITE_BUFFER_SIZE_BYTES);
+        rocksdb::Cache::new_lru_cache(block_cache_size_bytes + write_buffer_size_bytes);
 
     let write_buffer_manager = Arc::new(
         rocksdb::WriteBufferManager::new_write_buffer_manager_with_cache(
-            BLOCK_CACHE_SIZE_BYTES,
-            ALLOW_STALL,
+            block_cache_size_bytes,
+            args.allow_stall,
             block_cache.clone(),
         ),
     );
@@ -58,7 +86,9 @@ pub fn main() -> anyhow::Result<()> {
     block_opts.set_data_block_index_type(rocksdb::DataBlockIndexType::BinaryAndHash);
     cf_opts.set_block_based_table_factory(&block_opts);
 
-    let column_family_names: Vec<_> = (0..COLUMN_FAMILY_COUNT).map(|i| format!("cf{i}")).collect();
+    let column_family_names: Vec<_> = (0..args.column_family_count)
+        .map(|i| format!("cf{i}"))
+        .collect();
 
     let db = Arc::new(rocksdb::DB::open_cf_descriptors(
         &db_opts,
@@ -119,7 +149,7 @@ pub fn main() -> anyhow::Result<()> {
                     }
 
                     let elapsed = last_report.elapsed();
-                    if elapsed >= Duration::from_millis(REPORT_INTERVAL_MILLIS) {
+                    if elapsed >= Duration::from_millis(args.report_interval_millis) {
                         let block_cache_usage = block_cache.get_usage() as u64;
 
                         let mut cf_maxs = Vec::new();
@@ -145,7 +175,7 @@ pub fn main() -> anyhow::Result<()> {
                                 "{}",
                                 ByteSize::b(block_cache_usage.saturating_sub(wbm_size)).display()
                             ),
-                            format!("{:.1}%", (block_cache_usage.saturating_sub(wbm_size) as f64 / BLOCK_CACHE_SIZE_BYTES as f64) * 100.0),
+                            format!("{:.1}%", (block_cache_usage.saturating_sub(wbm_size) as f64 / block_cache_size_bytes as f64) * 100.0),
                             format!("{}", ByteSize::b(avg as u64).display()),
                             format!("{}", ByteSize::b(max).display()),
                             format!("{}", ByteSize::b(rss).display()),
@@ -181,7 +211,7 @@ pub fn main() -> anyhow::Result<()> {
                     let mut key = 0u64;
                     let val = vec![0u8; 1024];
 
-                    let thread_writes = match (UNEVEN_WRITE_LOAD, idx % 4) {
+                    let thread_writes = match (args.uneven_write_load, idx % 4) {
                         (false, _) => 1u64,
                         (_, 0) => 8,
                         (_, 1) => 4,
@@ -212,7 +242,7 @@ pub fn main() -> anyhow::Result<()> {
 
         let readers: Vec<_> = column_family_names
             .iter()
-            .take(COLUMN_FAMILY_READERS)
+            .take(args.column_family_readers)
             .map(|name| {
                 let db = Arc::clone(&db);
 
@@ -238,7 +268,7 @@ pub fn main() -> anyhow::Result<()> {
             })
             .collect();
 
-        std::thread::sleep(Duration::from_secs(TEST_DURATION_SECONDS));
+        std::thread::sleep(Duration::from_secs(args.test_duration_seconds));
         running.store(false, Ordering::Relaxed);
 
         for t in writers.into_iter().chain(readers.into_iter()) {
