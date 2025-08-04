@@ -12,9 +12,10 @@ pub fn main() -> anyhow::Result<()> {
     const COLUMN_FAMILY_COUNT: usize = 24; // every CF gets a writer
     const COLUMN_FAMILY_READERS: usize = 24; // capped to CF count
     const UNEVEN_WRITE_LOAD: bool = true;
-    const WRITE_BUFFER_SIZE_BYTES: usize = ByteSize::mib(1000).as_u64() as usize;
-    const BLOCK_CACHE_SIZE_BYTES: usize = ByteSize::mib(1000).as_u64() as usize; // excluding write buffers
-    const REPORT_INTERVAL_MILLIS: u64 = 500;
+    const WRITE_BUFFER_SIZE_BYTES: usize = ByteSize::mib(3200).as_u64() as usize;
+    const BLOCK_CACHE_SIZE_BYTES: usize = ByteSize::mib(3200).as_u64() as usize; // excluding write buffers
+    const REPORT_INTERVAL_MILLIS: u64 = 1000;
+    const ALLOW_STALL: bool = true;
 
     let path = Path::new("target/db");
     let _ = std::fs::remove_dir_all(path);
@@ -26,7 +27,7 @@ pub fn main() -> anyhow::Result<()> {
     let write_buffer_manager = Arc::new(
         rocksdb::WriteBufferManager::new_write_buffer_manager_with_cache(
             BLOCK_CACHE_SIZE_BYTES,
-            true,
+            ALLOW_STALL,
             block_cache.clone(),
         ),
     );
@@ -37,8 +38,18 @@ pub fn main() -> anyhow::Result<()> {
     db_opts.set_write_buffer_manager(&write_buffer_manager);
 
     let mut cf_opts = rocksdb::Options::default();
-    cf_opts.set_write_buffer_size(write_buffer_manager.get_buffer_size() >> 2);
-    cf_opts.set_max_write_buffer_number(2);
+    cf_opts.set_write_buffer_size(
+        (write_buffer_manager.get_buffer_size() >> 2).min(ByteSize::mib(64).0 as usize),
+    );
+    cf_opts.set_max_write_buffer_number(1);
+    cf_opts.set_num_levels(5);
+    cf_opts.set_compression_per_level(&[
+        rocksdb::DBCompressionType::None,
+        rocksdb::DBCompressionType::None,
+        rocksdb::DBCompressionType::None,
+        rocksdb::DBCompressionType::None,
+        rocksdb::DBCompressionType::None,
+    ]);
 
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     block_opts.set_block_cache(&block_cache);
@@ -87,13 +98,16 @@ pub fn main() -> anyhow::Result<()> {
                     "read",
                 );
                 let mut last_report = Instant::now();
+                let mut wbm_usage = 0;
+                let mut wbm_size = 0;
+                let mut rss = 0;
                 loop {
-                    let wbm_usage = write_buffer_manager.get_usage() as u64;
-                    let wbm_size = write_buffer_manager.get_buffer_size() as u64;
-                    let rss = system
+                    wbm_usage = wbm_usage.max(write_buffer_manager.get_usage() as u64);
+                    wbm_size = wbm_size.max(write_buffer_manager.get_buffer_size() as u64);
+                    rss = rss.max(system
                         .refresh_process(pid)
                         .then(|| system.process(pid).expect("pid exists").memory())
-                        .expect("read process RSS succeeds");
+                        .expect("read process RSS succeeds"));
 
                     for (cf_idx, name) in column_family_names.iter().enumerate() {
                         let cf_handle = db.cf_handle(name).expect("cf exists");
@@ -143,6 +157,9 @@ pub fn main() -> anyhow::Result<()> {
                             cf_data.clear();
                         }
                         last_report = Instant::now();
+                        wbm_usage = 0;
+                        wbm_size = 0;
+                        rss = 0;
                     }
 
                     std::thread::sleep(Duration::from_millis(2));
@@ -172,18 +189,19 @@ pub fn main() -> anyhow::Result<()> {
                         (_, _) => 1, // 100%
                     };
 
+                    let mut write_opts = rocksdb::WriteOptions::new();
+                    write_opts.disable_wal(true);
+
                     while running.load(Ordering::Relaxed) {
                         let mut batch = rocksdb::WriteBatch::default();
-                        for _ in 0..10 {
-                            if key % thread_writes == 0 {
-                                batch.put_cf(&cf, format!("key{}", key), &val);
-                            }
+                        for _ in 0..(16 / thread_writes) {
+                            batch.put_cf(&cf, format!("k{}", key), &val);
                             key += 1;
                         }
                         bytes_written.fetch_add(batch.size_in_bytes() as u64, Ordering::Relaxed);
-                        db.write(batch)?;
-                        if key % 1000 == 0 {
-                            std::thread::sleep(Duration::from_millis(10));
+                        db.write_opt(batch, &write_opts)?;
+                        if key % 1600 == 0 {
+                            std::thread::sleep(Duration::from_millis(1));
                         }
                     }
 
@@ -230,6 +248,8 @@ pub fn main() -> anyhow::Result<()> {
 
         Ok(())
     })?;
+
+    db.flush()?;
 
     Ok(())
 }
