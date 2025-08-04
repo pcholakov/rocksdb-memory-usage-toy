@@ -8,12 +8,13 @@ use sysinfo::Pid;
 use sysinfo::System;
 
 pub fn main() -> anyhow::Result<()> {
-    const TEST_DURATION_SECONDS: u64 = 10;
-    const COLUMN_FAMILY_COUNT: usize = 24;   // every CF gets a writer
+    const TEST_DURATION_SECONDS: u64 = 20;
+    const COLUMN_FAMILY_COUNT: usize = 24; // every CF gets a writer
     const COLUMN_FAMILY_READERS: usize = 24; // capped to CF count
     const UNEVEN_WRITE_LOAD: bool = true;
     const WRITE_BUFFER_SIZE_BYTES: usize = ByteSize::mib(1000).as_u64() as usize;
     const BLOCK_CACHE_SIZE_BYTES: usize = ByteSize::mib(1000).as_u64() as usize; // excluding write buffers
+    const REPORT_INTERVAL_MILLIS: u64 = 500;
 
     let path = Path::new("target/db");
     let _ = std::fs::remove_dir_all(path);
@@ -33,7 +34,7 @@ pub fn main() -> anyhow::Result<()> {
     let mut db_opts = rocksdb::Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
-    db_opts.set_write_buffer_manager(&*write_buffer_manager);
+    db_opts.set_write_buffer_manager(&write_buffer_manager);
 
     let mut cf_opts = rocksdb::Options::default();
     cf_opts.set_write_buffer_size(write_buffer_manager.get_buffer_size() >> 2);
@@ -61,8 +62,6 @@ pub fn main() -> anyhow::Result<()> {
     let bytes_read = &AtomicU64::new(0);
     let running = &AtomicBool::new(true);
 
-    println!("Running for {TEST_DURATION_SECONDS}s...\n");
-
     std::thread::scope(|s| -> anyhow::Result<()> {
         let monitor = {
             let db = Arc::clone(&db);
@@ -75,14 +74,14 @@ pub fn main() -> anyhow::Result<()> {
                 let mut cf_sizes: Vec<Vec<u64>> = vec![Vec::new(); column_family_names.len()];
 
                 println!(
-                    "{:<12} {:>12} {:>12} {:>10} | {:>12} {:>12} {:>12} | {:>12} | {:>12} {:>12}",
+                    "{:<12} {:>12} {:<8} {:>12} {:<8} | {:>12} {:>12} | {:>12} | {:>12} {:>12}",
                     "Cache usage",
-                    "Cache ex-WBM",
                     "WBM usage",
-                    "WBM util",
-                    "memtable avg",
-                    "memtable max",
-                    "memtables",
+                    "util",
+                    "Cache ex-WBM",
+                    "util",
+                    "CF mem avg",
+                    "CF mem max",
                     "RSS",
                     "written",
                     "read",
@@ -102,23 +101,21 @@ pub fn main() -> anyhow::Result<()> {
                             .property_int_value_cf(&cf_handle, "rocksdb.size-all-mem-tables")
                             .expect("property exists")
                             .unwrap();
-                        cf_sizes[cf_idx].push(cf_usage as u64);
+                        cf_sizes[cf_idx].push(cf_usage);
                     }
 
                     let elapsed = last_report.elapsed();
-                    if elapsed >= Duration::from_millis(1000) {
+                    if elapsed >= Duration::from_millis(REPORT_INTERVAL_MILLIS) {
                         let block_cache_usage = block_cache.get_usage() as u64;
 
                         let mut cf_maxs = Vec::new();
                         let mut cf_totals = Vec::new();
-                        let mut total_current = 0;
 
                         for cf_data in &cf_sizes {
                             let max = cf_data.iter().fold(0, |a, &b| a.max(b));
                             let total = cf_data.iter().sum::<u64>() as f64;
                             cf_maxs.push(max);
                             cf_totals.push(total);
-                            total_current += cf_data.last().copied().unwrap_or(0) as u64;
                         }
                         let max = cf_maxs.iter().fold(0, |a, &b| a.max(b));
                         let avg = cf_totals.iter().sum::<f64>()
@@ -126,17 +123,17 @@ pub fn main() -> anyhow::Result<()> {
                             / cf_sizes.len() as f64;
 
                         println!(
-                            "{:<12} {:>12} {:>12} {:>10} | {:>12} {:>12} {:>12} | {:>12} | {:>12} {:>12}",
+                            "{:<12} {:>12} {:>8} {:>12} {:>8} | {:>12} {:>12} | {:>12} | {:>12} {:>12}",
                             format!("{}", ByteSize::b(block_cache_usage).display()),
+                            format!("{}", ByteSize::b(wbm_usage).display()),
+                            format!("{:.1}%", (wbm_usage as f64 / wbm_size as f64) * 100.0),
                             format!(
                                 "{}",
                                 ByteSize::b(block_cache_usage.saturating_sub(wbm_size)).display()
                             ),
-                            format!("{}", ByteSize::b(wbm_usage).display()),
-                            format!("{:.1}%", (wbm_usage as f64 / wbm_size as f64) * 100.0),
+                            format!("{:.1}%", (block_cache_usage.saturating_sub(wbm_size) as f64 / BLOCK_CACHE_SIZE_BYTES as f64) * 100.0),
                             format!("{}", ByteSize::b(avg as u64).display()),
                             format!("{}", ByteSize::b(max).display()),
-                            format!("{}", ByteSize::b(total_current).display()),
                             format!("{}", ByteSize::b(rss).display()),
                             format!("{}/s", ByteSize::b((bytes_written.swap(0, Ordering::Relaxed) as f64 / elapsed.as_secs_f64()) as u64).display()),
                             format!("{}/s", ByteSize::b((bytes_read.swap(0, Ordering::Relaxed) as f64 / elapsed.as_secs_f64()) as u64).display()),
@@ -163,7 +160,7 @@ pub fn main() -> anyhow::Result<()> {
                 let db = Arc::clone(&db);
 
                 s.spawn(move || -> anyhow::Result<()> {
-                    let cf = db.cf_handle(&name).context("valid")?;
+                    let cf = db.cf_handle(name).context("valid")?;
                     let mut key = 0u64;
                     let val = vec![0u8; 1024];
 
@@ -202,7 +199,7 @@ pub fn main() -> anyhow::Result<()> {
                 let db = Arc::clone(&db);
 
                 s.spawn(move || -> anyhow::Result<()> {
-                    let cf = db.cf_handle(&name).context("valid")?;
+                    let cf = db.cf_handle(name).context("valid")?;
                     while running.load(Ordering::Relaxed) {
                         let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
                         let mut count = 0;
@@ -211,10 +208,8 @@ pub fn main() -> anyhow::Result<()> {
                             bytes_read
                                 .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
                             count += 1;
-                            if count % 10_000 == 0 {
-                                if !running.load(Ordering::Relaxed) {
-                                    break;
-                                };
+                            if count % 10_000 == 0 && !running.load(Ordering::Relaxed) {
+                                break;
                             }
                         }
                         std::thread::sleep(Duration::from_millis(100));
