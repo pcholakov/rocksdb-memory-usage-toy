@@ -2,7 +2,7 @@ use anyhow::Context;
 use bytesize::ByteSize;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use sysinfo::Pid;
 use sysinfo::System;
@@ -10,9 +10,10 @@ use sysinfo::System;
 pub fn main() -> anyhow::Result<()> {
     const TEST_DURATION_SECONDS: u64 = 60;
     const COLUMN_FAMILY_COUNT: usize = 24;
-    const COLUMN_FAMILY_READERS: usize = 24;
+    const COLUMN_FAMILY_READERS: usize = 12; // capped to CF count
     const BLOCK_CACHE_SIZE_MIB: usize = 500; // excluding write buffers
     const WRITE_BUFFER_SIZE_MIB: usize = 500;
+    const UNEVEN_WRITE_LOAD: bool = true;
 
     let path = Path::new("target/db");
     let _ = std::fs::remove_dir_all(path);
@@ -62,7 +63,10 @@ pub fn main() -> anyhow::Result<()> {
     );
     println!("Running for {TEST_DURATION_SECONDS}s...\n");
 
+    let bytes_written = &AtomicU64::new(0);
+    let bytes_read = &AtomicU64::new(0);
     let running = &AtomicBool::new(true);
+
     std::thread::scope(|s| -> anyhow::Result<()> {
         let monitor = {
             let db = Arc::clone(&db);
@@ -75,7 +79,7 @@ pub fn main() -> anyhow::Result<()> {
                 let mut cf_sizes: Vec<Vec<u64>> = vec![Vec::new(); column_family_names.len()];
 
                 println!(
-                    "{:<12} {:>12} {:>12} {:>10} {:>12} {:>12} {:>12} {:>12}",
+                    "{:<12} {:>12} {:>12} {:>10} | {:>12} {:>12} {:>12} | {:>12} | {:>12} {:>12}",
                     "Cache usage",
                     "Cache ex-WBM",
                     "WBM usage",
@@ -83,7 +87,9 @@ pub fn main() -> anyhow::Result<()> {
                     "memtable avg",
                     "memtable max",
                     "memtables",
-                    "RSS"
+                    "RSS",
+                    "written",
+                    "read",
                 );
                 let mut last_report = Instant::now();
                 loop {
@@ -123,7 +129,7 @@ pub fn main() -> anyhow::Result<()> {
                             / cf_sizes.len() as f64;
 
                         println!(
-                            "{:>12} {:>12} {:>12} {:>10} {:>12} {:>12} {:>12} {:>12}",
+                            "{:<12} {:>12} {:>12} {:>10} | {:>12} {:>12} {:>12} | {:>12} | {:>12} {:>12}",
                             format!("{}", ByteSize::b(block_cache_usage).display()),
                             format!(
                                 "{}",
@@ -134,7 +140,9 @@ pub fn main() -> anyhow::Result<()> {
                             format!("{}", ByteSize::b(avg as u64).display()),
                             format!("{}", ByteSize::b(max).display()),
                             format!("{}", ByteSize::b(total_current).display()),
-                            format!("{}", ByteSize::b(rss).display())
+                            format!("{}", ByteSize::b(rss).display()),
+                            format!("{}/s", ByteSize::b(bytes_written.swap(0, Ordering::Relaxed)).display()),
+                            format!("{}/s", ByteSize::b(bytes_read.swap(0, Ordering::Relaxed)).display()),
                         );
 
                         for cf_data in &mut cf_sizes {
@@ -159,17 +167,28 @@ pub fn main() -> anyhow::Result<()> {
 
                 s.spawn(move || -> anyhow::Result<()> {
                     let cf = db.cf_handle(&name).context("valid")?;
+                    let mut key = 0u64;
                     let val = vec![0u8; 1024];
 
-                    let mut k = 0usize;
-                    let mut ops_count = 0u64;
+                    let thread_writes = match (UNEVEN_WRITE_LOAD, idx % 4) {
+                        (false, _) => 1u64,
+                        (_, 0) => 8,
+                        (_, 1) => 4,
+                        (_, 2) => 2,
+                        (_, _) => 1, // 100%
+                    };
 
                     while running.load(Ordering::Relaxed) {
-                        db.put_cf(&cf, format!("thread{}_key{}", idx, k), &val)?;
-                        k += 1;
-                        ops_count += 1;
-
-                        if ops_count % 100 == 0 {
+                        let mut batch = rocksdb::WriteBatch::default();
+                        for _ in 0..10 {
+                            if key % thread_writes == 0 {
+                                batch.put_cf(&cf, format!("key{}", key), &val);
+                            }
+                            key += 1;
+                        }
+                        bytes_written.fetch_add(batch.size_in_bytes() as u64, Ordering::Relaxed);
+                        db.write(batch)?;
+                        if key % 1000 == 0 {
                             std::thread::sleep(Duration::from_millis(10));
                         }
                     }
@@ -187,12 +206,13 @@ pub fn main() -> anyhow::Result<()> {
 
                 s.spawn(move || -> anyhow::Result<()> {
                     let cf = db.cf_handle(&name).context("valid")?;
-
                     while running.load(Ordering::Relaxed) {
                         let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
                         let mut count = 0;
                         for item in iter {
-                            let (_key, _value) = item?;
+                            let (key, value) = item?;
+                            bytes_read
+                                .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
                             count += 1;
                             if count % 10_000 == 0 {
                                 if !running.load(Ordering::Relaxed) {
@@ -200,6 +220,7 @@ pub fn main() -> anyhow::Result<()> {
                                 };
                             }
                         }
+                        std::thread::sleep(Duration::from_millis(100));
                     }
 
                     Ok(())
